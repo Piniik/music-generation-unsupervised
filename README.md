@@ -18,6 +18,7 @@ If time permits, we may extend to:
 
 ## Repository Structure
 
+```text
 music-generation-unsupervised/
 ├── README.md
 ├── requirements.txt
@@ -27,7 +28,7 @@ music-generation-unsupervised/
 ├── src/
 ├── outputs/
 └── report/
-
+```
 ## Team Workflow
 - 24341268: preprocessing, baselines, evaluation
 - 22141022: VAE, training, generation
