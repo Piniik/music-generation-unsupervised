@@ -53,22 +53,22 @@ SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
 # -----------------------------
 # Model config: VAE
 # -----------------------------
-EMBED_DIM = 128
-HIDDEN_DIM = 256
+EMBED_DIM = 64
+HIDDEN_DIM = 128
 LATENT_DIM = 64
 NUM_LAYERS = 1
-DROPOUT = 0.2
+DROPOUT = 0.3
 
 # -----------------------------
 # Training config
 # -----------------------------
 BATCH_SIZE = 32
-NUM_EPOCHS = 30
+NUM_EPOCHS = 15
 LEARNING_RATE = 1e-3
 
 BETA_START = 0.0
-BETA_END = 0.1
-BETA_ANNEAL_EPOCHS = 10
+BETA_END = 0.5
+BETA_ANNEAL_EPOCHS = 20
 
 DEVICE = "cuda"  # fallback to cpu in code if unavailable
 

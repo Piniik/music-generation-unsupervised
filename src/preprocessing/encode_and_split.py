@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from src.config import PROCESSED_DIR, RANDOM_SEED, SPLIT_DIR, TRAIN_RATIO, VAL_RATIO, TEST_RATIO
 
@@ -34,20 +34,69 @@ def encode_windows(windowed_dataset: List[Dict], vocab: Dict[str, int]) -> List[
     return encoded
 
 
-def split_dataset(encoded_dataset: List[Dict]) -> tuple[List[Dict], List[Dict], List[Dict]]:
+def split_file_paths(file_paths: List[str]) -> Tuple[set, set, set]:
     random.seed(RANDOM_SEED)
-    items = encoded_dataset[:]
-    random.shuffle(items)
 
-    n = len(items)
+    unique_files = sorted(set(file_paths))
+    random.shuffle(unique_files)
+
+    n = len(unique_files)
     n_train = int(n * TRAIN_RATIO)
     n_val = int(n * VAL_RATIO)
 
-    train_data = items[:n_train]
-    val_data = items[n_train:n_train + n_val]
-    test_data = items[n_train + n_val:]
+    train_files = set(unique_files[:n_train])
+    val_files = set(unique_files[n_train:n_train + n_val])
+    test_files = set(unique_files[n_train + n_val:])
+
+    return train_files, val_files, test_files
+
+
+def split_dataset_by_file(encoded_dataset: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    all_file_paths = [item["file_path"] for item in encoded_dataset]
+    train_files, val_files, test_files = split_file_paths(all_file_paths)
+
+    train_data = []
+    val_data = []
+    test_data = []
+
+    for item in encoded_dataset:
+        file_path = item["file_path"]
+
+        if file_path in train_files:
+            train_data.append(item)
+        elif file_path in val_files:
+            val_data.append(item)
+        elif file_path in test_files:
+            test_data.append(item)
+        else:
+            raise ValueError(f"File path not assigned to any split: {file_path}")
 
     return train_data, val_data, test_data
+
+
+def summarize_split(train_data: List[Dict], val_data: List[Dict], test_data: List[Dict]) -> None:
+    train_files = {item["file_path"] for item in train_data}
+    val_files = {item["file_path"] for item in val_data}
+    test_files = {item["file_path"] for item in test_data}
+
+    print("Unique files per split:")
+    print(f"  Train files: {len(train_files)}")
+    print(f"  Val files:   {len(val_files)}")
+    print(f"  Test files:  {len(test_files)}")
+
+    print("\nWindow counts per split:")
+    print(f"  Train windows: {len(train_data)}")
+    print(f"  Val windows:   {len(val_data)}")
+    print(f"  Test windows:  {len(test_data)}")
+
+    overlap_train_val = train_files.intersection(val_files)
+    overlap_train_test = train_files.intersection(test_files)
+    overlap_val_test = val_files.intersection(test_files)
+
+    print("\nFile overlap check:")
+    print(f"  Train ∩ Val:  {len(overlap_train_val)}")
+    print(f"  Train ∩ Test: {len(overlap_train_test)}")
+    print(f"  Val ∩ Test:   {len(overlap_val_test)}")
 
 
 if __name__ == "__main__":
@@ -60,7 +109,7 @@ if __name__ == "__main__":
     vocab = load_json(vocab_path)
 
     encoded_dataset = encode_windows(windowed_dataset, vocab)
-    train_data, val_data, test_data = split_dataset(encoded_dataset)
+    train_data, val_data, test_data = split_dataset_by_file(encoded_dataset)
 
     save_json(encoded_dataset, SPLIT_DIR / "encoded_dataset_debug.json")
     save_json(train_data, SPLIT_DIR / "train_debug.json")
@@ -69,11 +118,9 @@ if __name__ == "__main__":
 
     print(f"Loaded windows: {len(windowed_dataset)}")
     print(f"Encoded windows: {len(encoded_dataset)}")
-    print(f"Vocab size: {len(vocab)}")
-    print()
-    print(f"Train size: {len(train_data)}")
-    print(f"Val size:   {len(val_data)}")
-    print(f"Test size:  {len(test_data)}")
+    print(f"Vocab size: {len(vocab)}\n")
+
+    summarize_split(train_data, val_data, test_data)
 
     if train_data:
         print("\nExample encoded sample:")
