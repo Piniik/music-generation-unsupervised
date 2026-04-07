@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+from random import random, randint
 from typing import List, Tuple
 
+from anyio import current_time
 import pretty_midi
 import torch
 
@@ -127,13 +129,13 @@ def velocity_bin_to_value(bin_idx: int) -> int:
 
 def parse_note_groups(tokens):
     """
-    Convert token groups into NON-OVERLAPPING note tuples:
+    Convert token groups into POLYPHONIC note tuples:
     (start_time, pitch, duration, velocity)
-
-    This is a debug/listening-friendly export mode.
     """
     notes = []
     current_time = 0.0
+    chord_epsilon = 0.0
+    seen = set()
 
     usable_length = len(tokens) - (len(tokens) % 4)
 
@@ -156,37 +158,40 @@ def parse_note_groups(tokens):
         duration_steps = int(d_tok.split("_")[-1])
         velocity_bin = int(v_tok.split("_")[-1])
 
-        # force forward movement so notes do not pile up
-        effective_shift = max(1, time_shift)
-        current_time += effective_shift * TIME_STEP
+        if time_shift > 0:
+            current_time += time_shift * TIME_STEP
+            chord_epsilon = 0.0
+        else:
+            chord_epsilon += 0.001
 
-        # keep notes short enough to hear distinct events
         duration = max(TIME_STEP, duration_steps * TIME_STEP)
-        duration = min(duration, TIME_STEP * 2)
-
         velocity = velocity_bin_to_value(velocity_bin)
 
         pitch = max(0, min(127, int(pitch)))
         velocity = max(1, min(127, int(velocity)))
 
-        start_time = float(current_time)
+        start_time = float(current_time + chord_epsilon)
         end_time = float(start_time + duration)
 
-        notes.append((start_time, pitch, duration, velocity))
+        if end_time - start_time < TIME_STEP:
+            end_time = start_time + TIME_STEP
 
-        # move time forward again so next note starts after this one
-        current_time = end_time
+        key = (round(start_time, 3), pitch, round(end_time, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        notes.append((start_time, pitch, end_time - start_time, velocity))
 
     return notes
 
 
 def tokens_to_pretty_midi(tokens):
     midi = pretty_midi.PrettyMIDI()
-    instrument = pretty_midi.Instrument(program=0)  # piano
+    program = randint(0, 127)
+    instrument = pretty_midi.Instrument(program=program)  # piano
 
     note_tuples = parse_note_groups(tokens)
-
-    # sort for safety
     note_tuples = sorted(note_tuples, key=lambda x: (x[0], x[1]))
 
     for start_time, pitch, duration, velocity in note_tuples:
