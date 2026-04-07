@@ -1,0 +1,14 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+pretty_midi
+mido
+music21
+torch
+torchvision
+torchaudio
+jupyter
+notebook
+tqdm
+pyyaml
