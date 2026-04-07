@@ -75,3 +75,19 @@ class MusicVAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         logits = self.decode(decoder_input, z)
         return logits, mu, logvar
+    
+    def decode_step(self, input_token, hidden, cell):
+        """
+        Single-step decoder.
+        input_token: [B]
+        """
+        embedded = self.embedding(input_token).unsqueeze(1)   # [B, 1, E]
+        output, (hidden, cell) = self.decoder(embedded, (hidden, cell))
+        logits = self.output_layer(output.squeeze(1))         # [B, V]
+        return logits, hidden, cell
+
+    def init_decoder_state(self, z):
+        hidden = self.latent_to_hidden(z)
+        hidden = hidden.unsqueeze(0).repeat(self.num_layers, 1, 1)
+        cell = torch.zeros_like(hidden)
+        return hidden, cell

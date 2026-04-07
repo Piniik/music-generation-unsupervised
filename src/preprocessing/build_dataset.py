@@ -72,7 +72,7 @@ def save_json(obj, path: Path) -> None:
 if __name__ == "__main__":
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    dataset = build_tokenized_dataset(max_files=100)
+    dataset = build_tokenized_dataset(max_files=1000)
     vocab = build_vocab(dataset)
 
     dataset_path = PROCESSED_DIR / "tokenized_dataset_debug.json"

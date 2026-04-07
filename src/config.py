@@ -77,7 +77,7 @@ DEVICE = "cuda"  # fallback to cpu in code if unavailable
 # -----------------------------
 NUM_GENERATED_SAMPLES = 8
 SAMPLING_TEMPERATURE = 1.0
-MAX_GENERATION_LENGTH = 128
+MAX_GENERATION_LENGTH = 1024
 
 
 def ensure_directories() -> None:

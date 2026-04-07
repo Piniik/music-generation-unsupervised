@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 from src.config import (
     BATCH_SIZE,
@@ -85,7 +86,9 @@ def train_one_epoch(model, dataloader, optimizer, device, bos_token_id: int, bet
     total_recon = 0.0
     total_kl = 0.0
 
-    for batch in dataloader:
+    progress_bar = tqdm(dataloader, desc="Training", leave=False)
+
+    for batch in progress_bar:
         batch = batch.to(device)
 
         decoder_input, targets = make_decoder_io(batch, bos_token_id)
@@ -103,6 +106,12 @@ def train_one_epoch(model, dataloader, optimizer, device, bos_token_id: int, bet
         total_recon += recon_loss.item()
         total_kl += kl_loss.item()
 
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            recon=f"{recon_loss.item():.4f}",
+            kl=f"{kl_loss.item():.4f}",
+        )
+
     n = len(dataloader)
     return total_loss / n, total_recon / n, total_kl / n
 
@@ -115,7 +124,9 @@ def evaluate(model, dataloader, device, bos_token_id: int, beta: float):
     total_recon = 0.0
     total_kl = 0.0
 
-    for batch in dataloader:
+    progress_bar = tqdm(dataloader, desc="Validation", leave=False)
+
+    for batch in progress_bar:
         batch = batch.to(device)
 
         decoder_input, targets = make_decoder_io(batch, bos_token_id)
@@ -126,6 +137,12 @@ def evaluate(model, dataloader, device, bos_token_id: int, beta: float):
         total_loss += loss.item()
         total_recon += recon_loss.item()
         total_kl += kl_loss.item()
+
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            recon=f"{recon_loss.item():.4f}",
+            kl=f"{kl_loss.item():.4f}",
+        )
 
     n = len(dataloader)
     return total_loss / n, total_recon / n, total_kl / n

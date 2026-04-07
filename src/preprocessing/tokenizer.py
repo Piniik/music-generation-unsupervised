@@ -11,7 +11,7 @@ from src.preprocessing.midi_parser import (
 TIME_STEP = 0.125
 MAX_TIME_SHIFT = 32
 MAX_DURATION = 32
-VELOCITY_BINS = [16, 32, 48, 64, 80, 96, 112, 128]
+VELOCITY_BINS = [16, 32, 48, 64, 80, 96, 112, 127]
 
 
 def quantize_value(value: float, step: float) -> int:
