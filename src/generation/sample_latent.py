@@ -2,15 +2,19 @@ import json
 from pathlib import Path
 
 import torch
+from torchgen import model
 
 from src.config import (
-    CHECKPOINT_DIR,
+    BEST_CHECKPOINT_PATH,
+    DROPOUT,
     EMBED_DIM,
     HIDDEN_DIM,
     LATENT_DIM,
-    NUM_LAYERS,
-    DROPOUT,
     MAX_GENERATION_LENGTH,
+    NUM_LAYERS,
+    SAMPLING_TEMPERATURE,
+    TOP_K,
+    VOCAB_PATH,
 )
 from src.models.vae import MusicVAE
 
@@ -44,15 +48,22 @@ def sample_next_token_constrained(
     current_token,
     hidden,
     cell,
+    z,
     valid_token_ids,
     temperature=1.0,
+    top_k=16,
 ):
-    logits, hidden, cell = model.decode_step(current_token, hidden, cell)
+    logits, hidden, cell = model.decode_step(current_token, hidden, cell, z)
     logits = logits / temperature
 
     mask = torch.full_like(logits, float("-inf"))
     mask[:, valid_token_ids] = 0.0
     masked_logits = logits + mask
+
+    if top_k is not None and top_k > 0:
+        top_values, _ = torch.topk(masked_logits, k=min(top_k, masked_logits.size(-1)), dim=-1)
+        kth = top_values[:, -1].unsqueeze(1)
+        masked_logits = torch.where(masked_logits < kth, torch.full_like(masked_logits, float("-inf")), masked_logits)
 
     probs = torch.softmax(masked_logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -98,10 +109,11 @@ def sample_from_latent_constrained(
             current_token=current_token,
             hidden=hidden,
             cell=cell,
+            z=z,
             valid_token_ids=valid_ids,
             temperature=temperature,
+            top_k=TOP_K,
         )
-
         token_id = int(next_token.item())
         generated_ids.append(token_id)
         current_token = next_token
@@ -111,8 +123,8 @@ def sample_from_latent_constrained(
 
 
 def main():
-    vocab_path = Path("data/processed/vocab_debug.json")
-    checkpoint_path = CHECKPOINT_DIR / "vae_debug_best.pt"
+    vocab_path = VOCAB_PATH
+    checkpoint_path = BEST_CHECKPOINT_PATH
 
     vocab, id_to_token = load_vocab(vocab_path)
     vocab_size = len(vocab)
@@ -129,20 +141,21 @@ def main():
         dropout=DROPOUT,
     ).to(device)
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    model.eval()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
 
     print(f"Loaded checkpoint: {checkpoint_path}\n")
 
     for i in range(3):
         tokens = sample_from_latent_constrained(
-            model=model,
-            vocab=vocab,
-            id_to_token=id_to_token,
-            device=device,
-            max_length=MAX_GENERATION_LENGTH,
-            temperature=1.0,
-        )
+        model=model,
+        vocab=vocab,
+        id_to_token=id_to_token,
+        device=device,
+        max_length=MAX_GENERATION_LENGTH,
+        temperature=SAMPLING_TEMPERATURE,
+)
 
         print(f"Sample {i + 1}:")
         print(tokens[:50])

@@ -5,7 +5,16 @@ import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from src.config import PROCESSED_DIR, RANDOM_SEED, SPLIT_DIR, TRAIN_RATIO, VAL_RATIO, TEST_RATIO
+from src.config import (
+    PROCESSED_DIR,
+    RANDOM_SEED,
+    SEQUENCE_LENGTH,
+    SPLIT_DIR,
+    TEST_RATIO,
+    TRAIN_RATIO,
+    UNK_TOKEN,
+    VAL_RATIO,
+)
 
 
 def load_json(path: Path):
@@ -21,13 +30,21 @@ def save_json(obj, path: Path) -> None:
 
 def encode_windows(windowed_dataset: List[Dict], vocab: Dict[str, int]) -> List[Dict]:
     encoded = []
+    unk_id = vocab[UNK_TOKEN]
 
     for item in windowed_dataset:
-        token_ids = [vocab[token] for token in item["tokens"] if token in vocab]
+        token_ids = [vocab.get(token, unk_id) for token in item["tokens"]]
+
+        if len(token_ids) != SEQUENCE_LENGTH:
+            raise ValueError(
+                f"Expected sequence length {SEQUENCE_LENGTH}, got {len(token_ids)} "
+                f"for {item['file_path']} window {item['window_index']}"
+            )
 
         encoded.append({
             "file_path": item["file_path"],
             "window_index": item["window_index"],
+            "start_token_index": item.get("start_token_index", 0),
             "token_ids": token_ids,
         })
 

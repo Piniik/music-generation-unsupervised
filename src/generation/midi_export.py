@@ -1,24 +1,29 @@
 import json
 from pathlib import Path
-from random import random, randint
-from typing import List, Tuple
+from typing import List
+from xml.parsers.expat import model
 
-from anyio import current_time
 import pretty_midi
 import torch
 
 from src.config import (
-    CHECKPOINT_DIR,
+    BEST_CHECKPOINT_PATH,
+    DEFAULT_BPM,
     DROPOUT,
     EMBED_DIM,
     GENERATED_MIDI_DIR,
     HIDDEN_DIM,
     LATENT_DIM,
     MAX_GENERATION_LENGTH,
+    NUM_GENERATED_SAMPLES,
     NUM_LAYERS,
+    SAMPLING_TEMPERATURE,
+    STEPS_PER_BEAT,
+    TOP_K,
+    VOCAB_PATH,
+    VELOCITY_BINS,
 )
 from src.models.vae import MusicVAE
-from src.preprocessing.tokenizer import TIME_STEP, VELOCITY_BINS
 
 
 def load_vocab(vocab_path: Path):
@@ -50,10 +55,12 @@ def sample_next_token_constrained(
     current_token,
     hidden,
     cell,
+    z,
     valid_token_pairs,
     temperature=1.0,
+    top_k=16,
 ):
-    logits, hidden, cell = model.decode_step(current_token, hidden, cell)
+    logits, hidden, cell = model.decode_step(current_token, hidden, cell, z)
     logits = logits / temperature
 
     valid_ids = [idx for _, idx in valid_token_pairs]
@@ -62,10 +69,10 @@ def sample_next_token_constrained(
     mask[:, valid_ids] = 0.0
     masked_logits = logits + mask
 
-    # downweight TIME_SHIFT_0 so notes do not all stack at the same moment
-    for token, idx in valid_token_pairs:
-        if token == "TIME_SHIFT_0":
-            masked_logits[:, idx] -= 2.0
+    if top_k is not None and top_k > 0:
+        top_values, _ = torch.topk(masked_logits, k=min(top_k, masked_logits.size(-1)), dim=-1)
+        kth = top_values[:, -1].unsqueeze(1)
+        masked_logits = torch.where(masked_logits < kth, torch.full_like(masked_logits, float("-inf")), masked_logits)
 
     probs = torch.softmax(masked_logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -110,8 +117,10 @@ def sample_from_latent_constrained(
             current_token=current_token,
             hidden=hidden,
             cell=cell,
+            z=z,
             valid_token_pairs=valid_pairs,
             temperature=temperature,
+            top_k=TOP_K,
         )
 
         token_id = int(next_token.item())
@@ -129,12 +138,12 @@ def velocity_bin_to_value(bin_idx: int) -> int:
 
 def parse_note_groups(tokens):
     """
-    Convert token groups into POLYPHONIC note tuples:
-    (start_time, pitch, duration, velocity)
+    Convert token groups into note tuples:
+    (start_time_seconds, pitch, duration_seconds, velocity)
     """
     notes = []
     current_time = 0.0
-    chord_epsilon = 0.0
+    seconds_per_step = (60.0 / DEFAULT_BPM) / STEPS_PER_BEAT
     seen = set()
 
     usable_length = len(tokens) - (len(tokens) % 4)
@@ -158,25 +167,17 @@ def parse_note_groups(tokens):
         duration_steps = int(d_tok.split("_")[-1])
         velocity_bin = int(v_tok.split("_")[-1])
 
-        if time_shift > 0:
-            current_time += time_shift * TIME_STEP
-            chord_epsilon = 0.0
-        else:
-            chord_epsilon += 0.001
-
-        duration = max(TIME_STEP, duration_steps * TIME_STEP)
+        current_time += time_shift * seconds_per_step
+        duration = max(seconds_per_step, duration_steps * seconds_per_step)
         velocity = velocity_bin_to_value(velocity_bin)
 
         pitch = max(0, min(127, int(pitch)))
         velocity = max(1, min(127, int(velocity)))
 
-        start_time = float(current_time + chord_epsilon)
+        start_time = float(current_time)
         end_time = float(start_time + duration)
 
-        if end_time - start_time < TIME_STEP:
-            end_time = start_time + TIME_STEP
-
-        key = (round(start_time, 3), pitch, round(end_time, 3))
+        key = (round(start_time, 4), pitch, round(end_time, 4))
         if key in seen:
             continue
         seen.add(key)
@@ -187,16 +188,14 @@ def parse_note_groups(tokens):
 
 
 def tokens_to_pretty_midi(tokens):
-    midi = pretty_midi.PrettyMIDI()
-    program = randint(0, 127)
-    instrument = pretty_midi.Instrument(program=program)  # piano
+    midi = pretty_midi.PrettyMIDI(initial_tempo=DEFAULT_BPM)
+    instrument = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
 
     note_tuples = parse_note_groups(tokens)
     note_tuples = sorted(note_tuples, key=lambda x: (x[0], x[1]))
 
     for start_time, pitch, duration, velocity in note_tuples:
         end_time = start_time + duration
-
         note = pretty_midi.Note(
             velocity=int(velocity),
             pitch=int(pitch),
@@ -215,8 +214,8 @@ def save_midi(midi_obj: pretty_midi.PrettyMIDI, output_path: Path):
 
 
 def main():
-    vocab_path = Path("data/processed/vocab_debug.json")
-    checkpoint_path = CHECKPOINT_DIR / "vae_debug_best.pt"
+    vocab_path = VOCAB_PATH
+    checkpoint_path = BEST_CHECKPOINT_PATH
 
     vocab, id_to_token = load_vocab(vocab_path)
     vocab_size = len(vocab)
@@ -233,19 +232,20 @@ def main():
         dropout=DROPOUT,
     ).to(device)
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    model.eval()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
 
     GENERATED_MIDI_DIR.mkdir(parents=True, exist_ok=True)
 
-    for i in range(8):
+    for i in range(NUM_GENERATED_SAMPLES):
         tokens = sample_from_latent_constrained(
             model=model,
             vocab=vocab,
             id_to_token=id_to_token,
             device=device,
             max_length=MAX_GENERATION_LENGTH,
-            temperature=1.0,
+            temperature=SAMPLING_TEMPERATURE,
         )
 
         midi_obj = tokens_to_pretty_midi(tokens)

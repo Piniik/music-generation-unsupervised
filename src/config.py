@@ -29,10 +29,15 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 # -----------------------------
 DATASET_NAME = "lakh_midi"
 
-TIME_RESOLUTION = 16          # steps per bar or quantization unit
-SEQUENCE_LENGTH = 128         # fixed-length token windows
-MIN_NOTES_PER_FILE = 10
-MAX_FILES_DEBUG = 200         # useful for early testing on a small subset
+TIME_RESOLUTION = 16          # steps per bar
+BEATS_PER_BAR = 4
+STEPS_PER_BEAT = TIME_RESOLUTION // BEATS_PER_BAR   # 4
+STEP_IN_BEATS = 1.0 / STEPS_PER_BEAT
+
+SEQUENCE_LENGTH = 512       # fixed-length token windows
+WINDOW_STRIDE = 256            # overlapping windows
+MIN_NOTES_PER_FILE = 20
+MAX_FILES_DEBUG = 1000
 
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10
@@ -50,6 +55,10 @@ UNK_TOKEN = "<UNK>"
 
 SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
 
+MAX_TIME_SHIFT_STEPS = 128     # up to 4 bars at 16 steps/bar
+MAX_DURATION_STEPS = 128
+VELOCITY_BINS = [16, 32, 48, 64, 80, 96, 112, 127]
+
 # -----------------------------
 # Model config: VAE
 # -----------------------------
@@ -66,19 +75,41 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 15
 LEARNING_RATE = 1e-3
 
-BETA_START = 0.0
+BETA_START = 0.02
 BETA_END = 0.5
-BETA_ANNEAL_EPOCHS = 20
+BETA_ANNEAL_EPOCHS = 10       # must be <= NUM_EPOCHS
+WORD_DROPOUT = 0.10
 
-DEVICE = "cuda"  # fallback to cpu in code if unavailable
+NUM_WORKERS = 4
+PIN_MEMORY = True
+USE_AMP = True
+
+DEVICE = "cuda"
 
 # -----------------------------
 # Generation config
 # -----------------------------
 NUM_GENERATED_SAMPLES = 8
 SAMPLING_TEMPERATURE = 1.0
-MAX_GENERATION_LENGTH = 1024
+TOP_K = 16
+MAX_GENERATION_LENGTH = 1536  # in tokens, corresponds to 4 bars at 16 steps/bar
+DEFAULT_BPM = 120
 
+
+# -----------------------------
+# Common filenames
+# -----------------------------
+TOKENIZED_DATASET_PATH = PROCESSED_DIR / "tokenized_dataset_debug.json"
+WINDOWED_DATASET_PATH = PROCESSED_DIR / "windowed_dataset_debug.json"
+VOCAB_PATH = PROCESSED_DIR / "vocab_debug.json"
+
+ENCODED_DATASET_PATH = SPLIT_DIR / "encoded_dataset_debug.json"
+TRAIN_PATH = SPLIT_DIR / "train_debug.json"
+VAL_PATH = SPLIT_DIR / "val_debug.json"
+TEST_PATH = SPLIT_DIR / "test_debug.json"
+
+BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "vae_debug_best.pt"
+HISTORY_PATH = CHECKPOINT_DIR / "vae_debug_history.json"
 
 def ensure_directories() -> None:
     """

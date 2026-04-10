@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 import pretty_midi
 
 from src.config import RAW_MIDI_DIR
+from src.config import MIN_NOTES_PER_FILE
 
 
 def find_midi_files(root_dir: Path = RAW_MIDI_DIR) -> List[Path]:
@@ -27,6 +28,9 @@ def summarize_midi(midi_obj: pretty_midi.PrettyMIDI, file_path: Path) -> Dict:
     drum_instruments = [instr for instr in instruments if instr.is_drum]
     duration = float(midi_obj.get_end_time())
 
+    tempos, _ = midi_obj.get_tempo_changes()
+    estimated_tempo = float(tempos[0]) if len(tempos) > 0 else float(midi_obj.estimate_tempo())
+
     return {
         "file_path": str(file_path),
         "num_instruments": len(instruments),
@@ -34,14 +38,18 @@ def summarize_midi(midi_obj: pretty_midi.PrettyMIDI, file_path: Path) -> Dict:
         "num_drum_instruments": len(drum_instruments),
         "total_notes": total_notes,
         "duration_seconds": round(duration, 2),
+        "resolution": int(midi_obj.resolution),
+        "estimated_tempo": round(estimated_tempo, 2),
     }
 
 
 def extract_note_events(midi_obj: pretty_midi.PrettyMIDI) -> List[Dict]:
     """
     Extract all note events from non-drum instruments and sort by start time.
+    Also compute beat-relative timing using MIDI ticks / resolution.
     """
     events: List[Dict] = []
+    resolution = midi_obj.resolution
 
     for instrument_idx, instrument in enumerate(midi_obj.instruments):
         if instrument.is_drum:
@@ -50,6 +58,15 @@ def extract_note_events(midi_obj: pretty_midi.PrettyMIDI) -> List[Dict]:
         program_name = pretty_midi.program_to_instrument_name(instrument.program)
 
         for note in instrument.notes:
+            if note.end <= note.start:
+                continue
+
+            start_tick = midi_obj.time_to_tick(note.start)
+            end_tick = midi_obj.time_to_tick(note.end)
+
+            start_beat = start_tick / resolution
+            duration_beats = max((end_tick - start_tick) / resolution, 1e-6)
+
             events.append({
                 "instrument_idx": instrument_idx,
                 "instrument_program": int(instrument.program),
@@ -58,12 +75,19 @@ def extract_note_events(midi_obj: pretty_midi.PrettyMIDI) -> List[Dict]:
                 "start": float(note.start),
                 "end": float(note.end),
                 "duration": float(note.end - note.start),
+                "start_tick": int(start_tick),
+                "end_tick": int(end_tick),
+                "start_beat": float(start_beat),
+                "duration_beats": float(duration_beats),
                 "velocity": int(note.velocity),
             })
 
-    events.sort(key=lambda x: (x["start"], x["pitch"], x["duration"]))
+    events.sort(key=lambda x: (x["start_beat"], x["pitch"], x["duration_beats"]))
     return events
 
+def is_usable_midi(midi_obj: pretty_midi.PrettyMIDI) -> bool:
+    total_notes = sum(len(instr.notes) for instr in midi_obj.instruments if not instr.is_drum)
+    return total_notes >= MIN_NOTES_PER_FILE
 
 if __name__ == "__main__":
     files = find_midi_files()
