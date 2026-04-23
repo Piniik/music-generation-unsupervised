@@ -111,6 +111,16 @@ TEST_PATH = SPLIT_DIR / "test_debug.json"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "vae_debug_best.pt"
 HISTORY_PATH = CHECKPOINT_DIR / "vae_debug_history.json"
 
+# -----------------------------
+# Model config: Transformer
+# -----------------------------
+TRANSFORMER_D_MODEL = 256
+TRANSFORMER_NHEAD = 8
+TRANSFORMER_NUM_LAYERS = 6
+TRANSFORMER_FF_DIM = 1024
+TRANSFORMER_DROPOUT = 0.1
+TRANSFORMER_MAX_SEQ_LEN = 512
+
 def ensure_directories() -> None:
     """
     Create all required project directories if they do not already exist.
