@@ -1,30 +1,24 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List
 
-import pretty_midi
 import torch
 
 from src.config import (
     CHECKPOINT_DIR,
-    DEFAULT_BPM,
     DROPOUT,
     EMBED_DIM,
-    GENERATED_MIDI_DIR,
     HIDDEN_DIM,
     LATENT_DIM,
     MAX_GENERATION_LENGTH,
-    NUM_GENERATED_SAMPLES,
     NUM_LAYERS,
     PROCESSED_DIR,
     SAMPLING_TEMPERATURE,
-    STEPS_PER_BEAT,
+    SPLIT_DIR,
     TOP_K,
     VOCAB_PATH,
-    VELOCITY_BINS,
 )
-from src.models.vae import MusicVAE
+from src.models.autoencoder import MusicAutoencoder
 
 
 def load_vocab(vocab_path: Path):
@@ -34,20 +28,25 @@ def load_vocab(vocab_path: Path):
     return vocab, id_to_token
 
 
-def get_valid_tokens_and_ids(vocab, step_type: str):
-    valid = []
+def load_dataset(json_path: Path):
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_valid_token_ids(vocab, step_type: str):
+    valid_ids = []
 
     for token, idx in vocab.items():
         if step_type == "TIME_SHIFT" and token.startswith("TIME_SHIFT_"):
-            valid.append((token, idx))
+            valid_ids.append(idx)
         elif step_type == "NOTE_ON" and token.startswith("NOTE_ON_"):
-            valid.append((token, idx))
+            valid_ids.append(idx)
         elif step_type == "DURATION" and token.startswith("DURATION_"):
-            valid.append((token, idx))
+            valid_ids.append(idx)
         elif step_type == "VELOCITY" and token.startswith("VELOCITY_"):
-            valid.append((token, idx))
+            valid_ids.append(idx)
 
-    return valid
+    return valid_ids
 
 
 @torch.no_grad()
@@ -57,17 +56,15 @@ def sample_next_token_constrained(
     hidden,
     cell,
     z,
-    valid_token_pairs,
+    valid_token_ids,
     temperature=1.0,
     top_k=16,
 ):
     logits, hidden, cell = model.decode_step(current_token, hidden, cell, z)
     logits = logits / temperature
 
-    valid_ids = [idx for _, idx in valid_token_pairs]
-
     mask = torch.full_like(logits, float("-inf"))
-    mask[:, valid_ids] = 0.0
+    mask[:, valid_token_ids] = 0.0
     masked_logits = logits + mask
 
     if top_k is not None and top_k > 0:
@@ -86,8 +83,9 @@ def sample_next_token_constrained(
 
 
 @torch.no_grad()
-def sample_from_latent_constrained(
+def sample_from_encoded_input(
     model,
+    source_token_ids,
     vocab,
     id_to_token,
     device,
@@ -97,26 +95,28 @@ def sample_from_latent_constrained(
 ):
     bos_id = vocab["<BOS>"]
 
-    valid_time_shift = get_valid_tokens_and_ids(vocab, "TIME_SHIFT")
-    valid_note_on = get_valid_tokens_and_ids(vocab, "NOTE_ON")
-    valid_duration = get_valid_tokens_and_ids(vocab, "DURATION")
-    valid_velocity = get_valid_tokens_and_ids(vocab, "VELOCITY")
+    valid_time_shift_ids = get_valid_token_ids(vocab, "TIME_SHIFT")
+    valid_note_on_ids = get_valid_token_ids(vocab, "NOTE_ON")
+    valid_duration_ids = get_valid_token_ids(vocab, "DURATION")
+    valid_velocity_ids = get_valid_token_ids(vocab, "VELOCITY")
 
-    z = torch.randn(1, model.latent_dim, device=device)
+    source = torch.tensor(source_token_ids, dtype=torch.long, device=device).unsqueeze(0)
+    z = model.encode(source)
+
     hidden, cell = model.init_decoder_state(z)
-
     current_token = torch.tensor([bos_id], dtype=torch.long, device=device)
+
     generated_ids = []
 
     pattern = [
-        valid_time_shift,
-        valid_note_on,
-        valid_duration,
-        valid_velocity,
+        ("TIME_SHIFT", valid_time_shift_ids),
+        ("NOTE_ON", valid_note_on_ids),
+        ("DURATION", valid_duration_ids),
+        ("VELOCITY", valid_velocity_ids),
     ]
 
     for step in range(max_length):
-        valid_pairs = pattern[step % 4]
+        _, valid_ids = pattern[step % 4]
 
         next_token, hidden, cell = sample_next_token_constrained(
             model=model,
@@ -124,7 +124,7 @@ def sample_from_latent_constrained(
             hidden=hidden,
             cell=cell,
             z=z,
-            valid_token_pairs=valid_pairs,
+            valid_token_ids=valid_ids,
             temperature=temperature,
             top_k=top_k,
         )
@@ -137,90 +137,12 @@ def sample_from_latent_constrained(
     return generated_tokens
 
 
-def velocity_bin_to_value(bin_idx: int) -> int:
-    bin_idx = max(0, min(bin_idx, len(VELOCITY_BINS) - 1))
-    return max(1, min(127, int(VELOCITY_BINS[bin_idx])))
-
-
-def parse_note_groups(tokens: List[str]):
-    notes = []
-    current_time = 0.0
-    seconds_per_step = (60.0 / DEFAULT_BPM) / STEPS_PER_BEAT
-    seen = set()
-
-    usable_length = len(tokens) - (len(tokens) % 4)
-
-    for i in range(0, usable_length, 4):
-        t_tok = tokens[i]
-        n_tok = tokens[i + 1]
-        d_tok = tokens[i + 2]
-        v_tok = tokens[i + 3]
-
-        if not (
-            t_tok.startswith("TIME_SHIFT_")
-            and n_tok.startswith("NOTE_ON_")
-            and d_tok.startswith("DURATION_")
-            and v_tok.startswith("VELOCITY_")
-        ):
-            continue
-
-        time_shift = int(t_tok.split("_")[-1])
-        pitch = int(n_tok.split("_")[-1])
-        duration_steps = int(d_tok.split("_")[-1])
-        velocity_bin = int(v_tok.split("_")[-1])
-
-        current_time += time_shift * seconds_per_step
-        duration = max(seconds_per_step, duration_steps * seconds_per_step)
-        velocity = velocity_bin_to_value(velocity_bin)
-
-        pitch = max(0, min(127, int(pitch)))
-        velocity = max(1, min(127, int(velocity)))
-
-        start_time = float(current_time)
-        end_time = float(start_time + duration)
-
-        key = (round(start_time, 4), pitch, round(end_time, 4))
-        if key in seen:
-            continue
-        seen.add(key)
-
-        notes.append((start_time, pitch, end_time - start_time, velocity))
-
-    return notes
-
-
-def tokens_to_pretty_midi(tokens: List[str]):
-    midi = pretty_midi.PrettyMIDI(initial_tempo=DEFAULT_BPM)
-    instrument = pretty_midi.Instrument(program=0)
-
-    note_tuples = parse_note_groups(tokens)
-    note_tuples = sorted(note_tuples, key=lambda x: (x[0], x[1]))
-
-    for start_time, pitch, duration, velocity in note_tuples:
-        end_time = start_time + duration
-        note = pretty_midi.Note(
-            velocity=int(velocity),
-            pitch=int(pitch),
-            start=float(start_time),
-            end=float(end_time),
-        )
-        instrument.notes.append(note)
-
-    midi.instruments.append(instrument)
-    return midi
-
-
-def save_midi(midi_obj: pretty_midi.PrettyMIDI, output_path: Path):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    midi_obj.write(str(output_path))
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export VAE-generated MIDI files.")
+    parser = argparse.ArgumentParser(description="Sample token sequences from a trained AE checkpoint.")
     parser.add_argument(
         "--checkpoint-name",
         type=str,
-        default="vae_debug_best.pt",
+        default="ae_debug_best.pt",
         help="Checkpoint filename inside checkpoints/.",
     )
     parser.add_argument(
@@ -230,10 +152,16 @@ def parse_args():
         help="Vocab filename inside data/processed/.",
     )
     parser.add_argument(
+        "--input-json",
+        type=str,
+        default="train_debug.json",
+        help="Input encoded dataset filename inside data/train_test_split/.",
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
-        default=NUM_GENERATED_SAMPLES,
-        help="Number of MIDI files to generate.",
+        default=3,
+        help="How many token sequences to print.",
     )
     parser.add_argument(
         "--max-length",
@@ -254,10 +182,10 @@ def parse_args():
         help="Top-k filtering.",
     )
     parser.add_argument(
-        "--output-prefix",
-        type=str,
-        default="vae_sample",
-        help="Filename prefix for generated MIDIs.",
+        "--start-index",
+        type=int,
+        default=0,
+        help="Start index into the input dataset.",
     )
     return parser.parse_args()
 
@@ -267,14 +195,16 @@ def main():
 
     vocab_path = PROCESSED_DIR / args.vocab_name
     checkpoint_path = CHECKPOINT_DIR / args.checkpoint_name
+    input_path = SPLIT_DIR / args.input_json
 
     vocab, id_to_token = load_vocab(vocab_path)
-    vocab_size = len(vocab)
+    input_data = load_dataset(input_path)
 
+    vocab_size = len(vocab)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    model = MusicVAE(
+    model = MusicAutoencoder(
         vocab_size=vocab_size,
         embed_dim=EMBED_DIM,
         hidden_dim=HIDDEN_DIM,
@@ -288,11 +218,21 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
 
-    GENERATED_MIDI_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Loaded input dataset: {input_path}\n")
 
-    for i in range(args.num_samples):
-        tokens = sample_from_latent_constrained(
+    start = max(0, args.start_index)
+    end = min(start + args.num_samples, len(input_data))
+
+    if start >= len(input_data):
+        raise ValueError(f"start-index {start} is out of range for dataset of size {len(input_data)}")
+
+    for i, item_idx in enumerate(range(start, end), start=1):
+        source_token_ids = input_data[item_idx]["token_ids"]
+
+        tokens = sample_from_encoded_input(
             model=model,
+            source_token_ids=source_token_ids,
             vocab=vocab,
             id_to_token=id_to_token,
             device=device,
@@ -301,15 +241,9 @@ def main():
             top_k=args.top_k,
         )
 
-        midi_obj = tokens_to_pretty_midi(tokens)
-        output_path = GENERATED_MIDI_DIR / f"{args.output_prefix}_{i+1}.mid"
-        save_midi(midi_obj, output_path)
-
-        print(f"Saved: {output_path}")
-        print(f"First 20 tokens: {tokens[:20]}")
+        print(f"Sample {i} (source idx {item_idx}):")
+        print(tokens[:50])
         print()
-
-    print("Done.")
 
 
 if __name__ == "__main__":

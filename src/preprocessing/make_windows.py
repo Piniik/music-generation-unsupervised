@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Dict, List
@@ -21,8 +22,14 @@ def save_json(obj, path: Path) -> None:
 def tokens_to_windows(tokens: List[str], window_size: int, stride: int) -> List[List[str]]:
     """
     Split a token sequence into fixed-length overlapping windows.
-    window_size and stride should both be multiples of 4 for the current event grammar.
+
+    For the current event grammar, both window_size and stride should be multiples of 4:
+    [TIME_SHIFT, NOTE_ON, DURATION, VELOCITY]
     """
+    if window_size <= 0:
+        raise ValueError("window_size must be positive.")
+    if stride <= 0:
+        raise ValueError("stride must be positive.")
     if window_size % 4 != 0 or stride % 4 != 0:
         raise ValueError("window_size and stride must be multiples of 4.")
 
@@ -37,11 +44,15 @@ def tokens_to_windows(tokens: List[str], window_size: int, stride: int) -> List[
 
 
 def build_windowed_dataset(dataset: List[Dict], window_size: int, stride: int) -> List[Dict]:
+    """
+    For each tokenized MIDI file, split tokens into fixed-length overlapping windows.
+    """
     all_windows: List[Dict] = []
 
     for item in dataset:
         file_path = item["file_path"]
         tokens = item["tokens"]
+        metadata = item.get("metadata", {})
 
         windows = tokens_to_windows(tokens, window_size, stride)
 
@@ -51,27 +62,65 @@ def build_windowed_dataset(dataset: List[Dict], window_size: int, stride: int) -
                 "window_index": window_idx,
                 "start_token_index": window_idx * stride,
                 "tokens": window,
+                "metadata": metadata,
             })
 
     return all_windows
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create overlapping token windows from a tokenized MIDI shard.")
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Input tokenized dataset JSON filename inside data/processed/",
+    )
+    parser.add_argument(
+        "--output-name",
+        type=str,
+        default=None,
+        help="Optional custom output filename. Defaults to windowed_<input filename>.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=SEQUENCE_LENGTH,
+        help="Window size in tokens.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=WINDOW_STRIDE,
+        help="Stride between consecutive windows.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    dataset_path = PROCESSED_DIR / "tokenized_dataset_debug.json"
-    output_path = PROCESSED_DIR / "windowed_dataset_debug.json"
+    args = parse_args()
+
+    dataset_path = PROCESSED_DIR / args.input
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Input dataset not found: {dataset_path}")
 
     dataset = load_json(dataset_path)
     windowed_dataset = build_windowed_dataset(
-    dataset,
-    window_size=SEQUENCE_LENGTH,
-    stride=WINDOW_STRIDE,
-)
+        dataset=dataset,
+        window_size=args.window_size,
+        stride=args.stride,
+    )
+
+    if args.output_name:
+        output_path = PROCESSED_DIR / args.output_name
+    else:
+        output_path = PROCESSED_DIR / f"windowed_{dataset_path.name}"
 
     save_json(windowed_dataset, output_path)
 
     print(f"Loaded tokenized dataset from: {dataset_path}")
-    print(f"Window size: {SEQUENCE_LENGTH}")
-    print(f"Window stride: {WINDOW_STRIDE}")
+    print(f"Window size: {args.window_size}")
+    print(f"Stride: {args.stride}")
     print(f"Total windows created: {len(windowed_dataset)}")
     print(f"Saved windowed dataset to: {output_path}")
 
@@ -79,4 +128,5 @@ if __name__ == "__main__":
         print("\nExample window:")
         print(f"File: {windowed_dataset[0]['file_path']}")
         print(f"Window index: {windowed_dataset[0]['window_index']}")
+        print(f"Start token index: {windowed_dataset[0]['start_token_index']}")
         print(f"First 20 tokens: {windowed_dataset[0]['tokens'][:20]}")

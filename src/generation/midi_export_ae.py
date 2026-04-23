@@ -19,12 +19,13 @@ from src.config import (
     NUM_LAYERS,
     PROCESSED_DIR,
     SAMPLING_TEMPERATURE,
+    SPLIT_DIR,
     STEPS_PER_BEAT,
     TOP_K,
     VOCAB_PATH,
     VELOCITY_BINS,
 )
-from src.models.vae import MusicVAE
+from src.models.autoencoder import MusicAutoencoder
 
 
 def load_vocab(vocab_path: Path):
@@ -32,6 +33,11 @@ def load_vocab(vocab_path: Path):
         vocab = json.load(f)
     id_to_token = {idx: token for token, idx in vocab.items()}
     return vocab, id_to_token
+
+
+def load_dataset(json_path: Path):
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def get_valid_tokens_and_ids(vocab, step_type: str):
@@ -86,8 +92,9 @@ def sample_next_token_constrained(
 
 
 @torch.no_grad()
-def sample_from_latent_constrained(
+def sample_from_encoded_input(
     model,
+    source_token_ids,
     vocab,
     id_to_token,
     device,
@@ -102,9 +109,10 @@ def sample_from_latent_constrained(
     valid_duration = get_valid_tokens_and_ids(vocab, "DURATION")
     valid_velocity = get_valid_tokens_and_ids(vocab, "VELOCITY")
 
-    z = torch.randn(1, model.latent_dim, device=device)
-    hidden, cell = model.init_decoder_state(z)
+    source = torch.tensor(source_token_ids, dtype=torch.long, device=device).unsqueeze(0)
+    z = model.encode(source)
 
+    hidden, cell = model.init_decoder_state(z)
     current_token = torch.tensor([bos_id], dtype=torch.long, device=device)
     generated_ids = []
 
@@ -216,11 +224,11 @@ def save_midi(midi_obj: pretty_midi.PrettyMIDI, output_path: Path):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export VAE-generated MIDI files.")
+    parser = argparse.ArgumentParser(description="Export AE-generated MIDI files.")
     parser.add_argument(
         "--checkpoint-name",
         type=str,
-        default="vae_debug_best.pt",
+        default="ae_debug_best.pt",
         help="Checkpoint filename inside checkpoints/.",
     )
     parser.add_argument(
@@ -228,6 +236,12 @@ def parse_args():
         type=str,
         default=VOCAB_PATH.name,
         help="Vocab filename inside data/processed/.",
+    )
+    parser.add_argument(
+        "--input-json",
+        type=str,
+        default="train_debug.json",
+        help="Input encoded dataset filename inside data/train_test_split/.",
     )
     parser.add_argument(
         "--num-samples",
@@ -256,8 +270,14 @@ def parse_args():
     parser.add_argument(
         "--output-prefix",
         type=str,
-        default="vae_sample",
+        default="ae_sample",
         help="Filename prefix for generated MIDIs.",
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="Start index into the input dataset.",
     )
     return parser.parse_args()
 
@@ -267,14 +287,16 @@ def main():
 
     vocab_path = PROCESSED_DIR / args.vocab_name
     checkpoint_path = CHECKPOINT_DIR / args.checkpoint_name
+    input_path = SPLIT_DIR / args.input_json
 
     vocab, id_to_token = load_vocab(vocab_path)
-    vocab_size = len(vocab)
+    input_data = load_dataset(input_path)
 
+    vocab_size = len(vocab)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    model = MusicVAE(
+    model = MusicAutoencoder(
         vocab_size=vocab_size,
         embed_dim=EMBED_DIM,
         hidden_dim=HIDDEN_DIM,
@@ -290,9 +312,18 @@ def main():
 
     GENERATED_MIDI_DIR.mkdir(parents=True, exist_ok=True)
 
-    for i in range(args.num_samples):
-        tokens = sample_from_latent_constrained(
+    start = max(0, args.start_index)
+    end = min(start + args.num_samples, len(input_data))
+
+    if start >= len(input_data):
+        raise ValueError(f"start-index {start} is out of range for dataset of size {len(input_data)}")
+
+    for out_idx, item_idx in enumerate(range(start, end), start=1):
+        source_token_ids = input_data[item_idx]["token_ids"]
+
+        tokens = sample_from_encoded_input(
             model=model,
+            source_token_ids=source_token_ids,
             vocab=vocab,
             id_to_token=id_to_token,
             device=device,
@@ -302,10 +333,10 @@ def main():
         )
 
         midi_obj = tokens_to_pretty_midi(tokens)
-        output_path = GENERATED_MIDI_DIR / f"{args.output_prefix}_{i+1}.mid"
+        output_path = GENERATED_MIDI_DIR / f"{args.output_prefix}_{out_idx}.mid"
         save_midi(midi_obj, output_path)
 
-        print(f"Saved: {output_path}")
+        print(f"Saved: {output_path} (source idx {item_idx})")
         print(f"First 20 tokens: {tokens[:20]}")
         print()
 

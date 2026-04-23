@@ -1,17 +1,18 @@
+import argparse
 import json
 from pathlib import Path
 
 import torch
-from torchgen import model
 
 from src.config import (
-    BEST_CHECKPOINT_PATH,
+    CHECKPOINT_DIR,
     DROPOUT,
     EMBED_DIM,
     HIDDEN_DIM,
     LATENT_DIM,
     MAX_GENERATION_LENGTH,
     NUM_LAYERS,
+    PROCESSED_DIR,
     SAMPLING_TEMPERATURE,
     TOP_K,
     VOCAB_PATH,
@@ -63,7 +64,11 @@ def sample_next_token_constrained(
     if top_k is not None and top_k > 0:
         top_values, _ = torch.topk(masked_logits, k=min(top_k, masked_logits.size(-1)), dim=-1)
         kth = top_values[:, -1].unsqueeze(1)
-        masked_logits = torch.where(masked_logits < kth, torch.full_like(masked_logits, float("-inf")), masked_logits)
+        masked_logits = torch.where(
+            masked_logits < kth,
+            torch.full_like(masked_logits, float("-inf")),
+            masked_logits,
+        )
 
     probs = torch.softmax(masked_logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -79,6 +84,7 @@ def sample_from_latent_constrained(
     device,
     max_length=128,
     temperature=1.0,
+    top_k=16,
 ):
     bos_id = vocab["<BOS>"]
 
@@ -91,7 +97,6 @@ def sample_from_latent_constrained(
     hidden, cell = model.init_decoder_state(z)
 
     current_token = torch.tensor([bos_id], dtype=torch.long, device=device)
-
     generated_ids = []
 
     pattern = [
@@ -112,8 +117,9 @@ def sample_from_latent_constrained(
             z=z,
             valid_token_ids=valid_ids,
             temperature=temperature,
-            top_k=TOP_K,
+            top_k=top_k,
         )
+
         token_id = int(next_token.item())
         generated_ids.append(token_id)
         current_token = next_token
@@ -122,9 +128,52 @@ def sample_from_latent_constrained(
     return generated_tokens
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sample token sequences from a trained VAE checkpoint.")
+    parser.add_argument(
+        "--checkpoint-name",
+        type=str,
+        default="vae_debug_best.pt",
+        help="Checkpoint filename inside checkpoints/.",
+    )
+    parser.add_argument(
+        "--vocab-name",
+        type=str,
+        default=VOCAB_PATH.name,
+        help="Vocab filename inside data/processed/.",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=3,
+        help="How many token sequences to print.",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=MAX_GENERATION_LENGTH,
+        help="Maximum generated token length.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=SAMPLING_TEMPERATURE,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=TOP_K,
+        help="Top-k filtering.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    vocab_path = VOCAB_PATH
-    checkpoint_path = BEST_CHECKPOINT_PATH
+    args = parse_args()
+
+    vocab_path = PROCESSED_DIR / args.vocab_name
+    checkpoint_path = CHECKPOINT_DIR / args.checkpoint_name
 
     vocab, id_to_token = load_vocab(vocab_path)
     vocab_size = len(vocab)
@@ -144,18 +193,20 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
+    model.eval()
 
     print(f"Loaded checkpoint: {checkpoint_path}\n")
 
-    for i in range(3):
+    for i in range(args.num_samples):
         tokens = sample_from_latent_constrained(
-        model=model,
-        vocab=vocab,
-        id_to_token=id_to_token,
-        device=device,
-        max_length=MAX_GENERATION_LENGTH,
-        temperature=SAMPLING_TEMPERATURE,
-)
+            model=model,
+            vocab=vocab,
+            id_to_token=id_to_token,
+            device=device,
+            max_length=args.max_length,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
 
         print(f"Sample {i + 1}:")
         print(tokens[:50])

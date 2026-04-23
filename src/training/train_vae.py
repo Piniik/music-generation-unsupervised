@@ -1,3 +1,5 @@
+import argparse
+import glob
 import json
 import random
 from pathlib import Path
@@ -11,7 +13,9 @@ from tqdm import tqdm
 from src.config import (
     BATCH_SIZE,
     BEST_CHECKPOINT_PATH,
-    CHECKPOINT_DIR,
+    BETA_ANNEAL_EPOCHS,
+    BETA_END,
+    BETA_START,
     DROPOUT,
     EMBED_DIM,
     HIDDEN_DIM,
@@ -20,18 +24,14 @@ from src.config import (
     LEARNING_RATE,
     NUM_EPOCHS,
     NUM_LAYERS,
-    BETA_START,
-    BETA_END,
-    BETA_ANNEAL_EPOCHS,
-    NUM_WORKERS,
-    PIN_MEMORY,
     RANDOM_SEED,
-    TRAIN_PATH,
+    SPLIT_DIR,
     USE_AMP,
-    VAL_PATH,
     VOCAB_PATH,
     WORD_DROPOUT,
 )
+from src.models.vae import MusicVAE
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -40,23 +40,24 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def apply_word_dropout(decoder_input: torch.Tensor, bos_token_id: int, unk_token_id: int, drop_prob: float):
-    if drop_prob <= 0:
-        return decoder_input
+class MultiFileMusicTokenDataset(Dataset):
+    def __init__(self, json_paths):
+        self.data = []
+        self.source_files = []
 
-    dropped = decoder_input.clone()
-    mask = (torch.rand_like(decoder_input.float()) < drop_prob)
-    mask[:, 0] = False
-    dropped[mask] = unk_token_id
-    return dropped
+        for path in json_paths:
+            with open(path, "r", encoding="utf-8") as f:
+                shard_data = json.load(f)
 
-class MusicTokenDataset(Dataset):
-    def __init__(self, json_path: Path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
-        for item in self.data:
-            if "token_ids" not in item:
-                raise ValueError("Missing token_ids in dataset item.")
+            for item in shard_data:
+                if "token_ids" not in item:
+                    raise ValueError(f"Missing token_ids in dataset item from {path}")
+                self.data.append(item)
+
+            self.source_files.append(str(path))
+
+        if len(self.data) == 0:
+            raise ValueError("No training samples loaded.")
 
     def __len__(self):
         return len(self.data)
@@ -66,9 +67,23 @@ class MusicTokenDataset(Dataset):
         return torch.tensor(token_ids, dtype=torch.long)
 
 
+def resolve_split_files(patterns):
+    matched = []
+
+    for pattern in patterns:
+        full_pattern = str(SPLIT_DIR / pattern)
+        matched.extend(glob.glob(full_pattern))
+
+    matched = sorted(set(matched))
+    if not matched:
+        raise FileNotFoundError(f"No files matched patterns: {patterns}")
+
+    return [Path(p) for p in matched]
+
+
 def get_beta(epoch: int) -> float:
     """
-    Linearly anneal beta from BETA_START to BETA_END and actually hit BETA_END.
+    Linearly anneal beta and actually reach BETA_END.
     """
     if BETA_ANNEAL_EPOCHS <= 1:
         return BETA_END
@@ -83,7 +98,10 @@ def vae_loss_function(logits, targets, mu, logvar, beta: float):
     targets:  [B, T]
     mu/logvar: [B, latent_dim]
     """
-    recon_loss = nn.CrossEntropyLoss()(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    recon_loss = nn.CrossEntropyLoss()(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+    )
 
     kl_loss = -0.5 * torch.mean(
         torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
@@ -95,11 +113,8 @@ def vae_loss_function(logits, targets, mu, logvar, beta: float):
 
 def make_decoder_io(batch: torch.Tensor, bos_token_id: int):
     """
-    For a sequence:
-      target = [t1, t2, t3, ..., tT]
-      input  = [BOS, t1, t2, ..., t(T-1)]
-
-    This prevents trivial full-sequence copying.
+    target = [t1, t2, ..., tT]
+    input  = [BOS, t1, ..., t(T-1)]
     """
     decoder_input = batch.clone()
     decoder_input[:, 1:] = batch[:, :-1]
@@ -109,7 +124,28 @@ def make_decoder_io(batch: torch.Tensor, bos_token_id: int):
     return decoder_input, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, bos_token_id: int, unk_token_id: int, beta: float, scaler, amp_enabled: bool):
+def apply_word_dropout(decoder_input: torch.Tensor, bos_token_id: int, unk_token_id: int, drop_prob: float):
+    if drop_prob <= 0:
+        return decoder_input
+
+    dropped = decoder_input.clone()
+    mask = (torch.rand_like(decoder_input.float()) < drop_prob)
+    mask[:, 0] = False
+    dropped[mask] = unk_token_id
+    return dropped
+
+
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    device,
+    bos_token_id: int,
+    unk_token_id: int,
+    beta: float,
+    scaler,
+    amp_enabled: bool,
+):
     model.train()
 
     total_loss = 0.0
@@ -122,11 +158,20 @@ def train_one_epoch(model, dataloader, optimizer, device, bos_token_id: int, unk
         batch = batch.to(device)
 
         decoder_input, targets = make_decoder_io(batch, bos_token_id)
-        decoder_input = apply_word_dropout(decoder_input, bos_token_id, unk_token_id, WORD_DROPOUT)
+        decoder_input = apply_word_dropout(
+            decoder_input=decoder_input,
+            bos_token_id=bos_token_id,
+            unk_token_id=unk_token_id,
+            drop_prob=WORD_DROPOUT,
+        )
 
         optimizer.zero_grad()
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(amp_enabled and device == "cuda")):
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=(amp_enabled and device == "cuda"),
+        ):
             logits, mu, logvar = model(batch, decoder_input)
             loss, recon_loss, kl_loss = vae_loss_function(logits, targets, mu, logvar, beta)
 
@@ -139,6 +184,12 @@ def train_one_epoch(model, dataloader, optimizer, device, bos_token_id: int, unk
         total_loss += loss.item()
         total_recon += recon_loss.item()
         total_kl += kl_loss.item()
+
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            recon=f"{recon_loss.item():.4f}",
+            kl=f"{kl_loss.item():.4f}",
+        )
 
     n = len(dataloader)
     return total_loss / n, total_recon / n, total_kl / n
@@ -158,7 +209,6 @@ def evaluate(model, dataloader, device, bos_token_id: int, beta: float):
         batch = batch.to(device)
 
         decoder_input, targets = make_decoder_io(batch, bos_token_id)
-
         logits, mu, logvar = model(batch, decoder_input)
         loss, recon_loss, kl_loss = vae_loss_function(logits, targets, mu, logvar, beta)
 
@@ -176,41 +226,77 @@ def evaluate(model, dataloader, device, bos_token_id: int, beta: float):
     return total_loss / n, total_recon / n, total_kl / n
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train VAE from sharded train/val JSON files.")
+    parser.add_argument(
+        "--train-patterns",
+        nargs="+",
+        default=["train_*.json"],
+        help="Glob patterns inside data/train_test_split/ for train shards.",
+    )
+    parser.add_argument(
+        "--val-patterns",
+        nargs="+",
+        default=["val_*.json"],
+        help="Glob patterns inside data/train_test_split/ for val shards.",
+    )
+    parser.add_argument(
+        "--checkpoint-name",
+        type=str,
+        default=BEST_CHECKPOINT_PATH.name,
+        help="Output checkpoint filename inside checkpoints/.",
+    )
+    parser.add_argument(
+        "--history-name",
+        type=str,
+        default=HISTORY_PATH.name,
+        help="Output history filename inside checkpoints/.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    from src.models.vae import MusicVAE
+    args = parse_args()
     set_seed(RANDOM_SEED)
 
-    train_path = TRAIN_PATH
-    val_path = VAL_PATH
-    vocab_path = VOCAB_PATH
-
-    with open(vocab_path, "r", encoding="utf-8") as f:
+    with open(VOCAB_PATH, "r", encoding="utf-8") as f:
         vocab = json.load(f)
 
-    unk_token_id = vocab["<UNK>"]
     vocab_size = len(vocab)
     bos_token_id = vocab["<BOS>"]
+    unk_token_id = vocab["<UNK>"]
+
+    train_files = resolve_split_files(args.train_patterns)
+    val_files = resolve_split_files(args.val_patterns)
+
+    print("Train shard files:")
+    for p in train_files:
+        print(f"  {p.name}")
+
+    print("\nVal shard files:")
+    for p in val_files:
+        print(f"  {p.name}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"\nUsing device: {device}")
 
-    train_dataset = MusicTokenDataset(train_path)
-    val_dataset = MusicTokenDataset(val_path)
+    train_dataset = MultiFileMusicTokenDataset(train_files)
+    val_dataset = MultiFileMusicTokenDataset(val_files)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
     )
 
     model = MusicVAE(
@@ -224,7 +310,14 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = BEST_CHECKPOINT_PATH.parent / args.checkpoint_name
+    history_path = HISTORY_PATH.parent / args.history_name
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    amp_enabled = USE_AMP and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
     best_val_loss = float("inf")
 
     history = {
@@ -236,20 +329,35 @@ def main():
         "val_loss": [],
         "val_recon": [],
         "val_kl": [],
+        "train_files": [p.name for p in train_files],
+        "val_files": [p.name for p in val_files],
     }
 
-    amp_enabled = USE_AMP and torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    print(f"\nTrain samples: {len(train_dataset)}")
+    print(f"Val samples:   {len(val_dataset)}")
+    print(f"Vocab size:    {vocab_size}")
 
     for epoch in range(1, NUM_EPOCHS + 1):
         beta = get_beta(epoch)
 
         train_loss, train_recon, train_kl = train_one_epoch(
-        model, train_loader, optimizer, device, bos_token_id, unk_token_id, beta, scaler, amp_enabled
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            bos_token_id=bos_token_id,
+            unk_token_id=unk_token_id,
+            beta=beta,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
         )
-        
+
         val_loss, val_recon, val_kl = evaluate(
-            model, val_loader, device, bos_token_id, beta
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            bos_token_id=bos_token_id,
+            beta=beta,
         )
 
         history["epoch"].append(epoch)
@@ -278,15 +386,15 @@ def main():
                     "best_val_loss": best_val_loss,
                     "vocab_size": vocab_size,
                 },
-                BEST_CHECKPOINT_PATH,
+                checkpoint_path,
             )
-            print(f"Saved best model to {BEST_CHECKPOINT_PATH}")
+            print(f"Saved best model to {checkpoint_path}")
 
-    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+    with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    print(f"Saved training history to {HISTORY_PATH}")
+    print(f"Saved training history to {history_path}")
+
 
 if __name__ == "__main__":
     main()
-    
