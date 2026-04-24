@@ -121,6 +121,32 @@ TRANSFORMER_FF_DIM = 1024
 TRANSFORMER_DROPOUT = 0.1
 TRANSFORMER_MAX_SEQ_LEN = 512
 
+# -----------------------------
+# Task 4: RLHF config
+# -----------------------------
+RLHF_DIR = OUTPUTS_DIR / "rlhf"
+RLHF_SURVEY_MIDI_DIR = RLHF_DIR / "survey_midis"
+RLHF_TOKEN_DIR = RLHF_DIR / "tokens"
+RLHF_SCORE_CSV = RLHF_DIR / "human_scores.csv"
+
+REWARD_MODEL_CHECKPOINT = CHECKPOINT_DIR / "reward_model_best.pt"
+RLHF_TRANSFORMER_CHECKPOINT = CHECKPOINT_DIR / "transformer_rlhf_best.pt"
+
+RLHF_NUM_SURVEY_SAMPLES = 20
+RLHF_MAX_NEW_TOKENS = 512
+RLHF_PRIMER_LENGTH = 16
+
+REWARD_EMBED_DIM = 128
+REWARD_HIDDEN_DIM = 256
+REWARD_NUM_EPOCHS = 20
+REWARD_BATCH_SIZE = 16
+REWARD_LEARNING_RATE = 1e-3
+
+RLHF_ITERATIONS = 200
+RLHF_BATCH_SIZE = 4
+RLHF_LEARNING_RATE = 1e-5
+RLHF_KL_COEF = 0.01
+
 def ensure_directories() -> None:
     """
     Create all required project directories if they do not already exist.
