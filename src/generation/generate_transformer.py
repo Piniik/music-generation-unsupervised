@@ -292,12 +292,17 @@ def main():
     vocab, id_to_token = load_vocab(vocab_path)
     input_data = load_dataset(input_path)
 
-    vocab_size = len(vocab)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
     print(f"Using device: {device}")
 
     model = MusicTransformer(
-        vocab_size=vocab_size,
+        vocab_size=len(vocab),
         max_seq_len=TRANSFORMER_MAX_SEQ_LEN,
         d_model=TRANSFORMER_D_MODEL,
         nhead=TRANSFORMER_NHEAD,
