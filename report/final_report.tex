@@ -298,6 +298,58 @@ RLHF & 0.5936 best reward & -- & High & Reward-model-guided tuning \\
 
 The numerical AE and VAE losses should be filled from the final saved history files after the last runs complete. The Transformer table already includes the observed full-dataset training log values from the current implementation.
 
+
+\subsection{Cross-Task Comparison}
+To make the progression across the four tasks explicit, Table~\ref{tab:cross_task_compare} compares the models along objective, sampling strategy, evaluation criterion, and practical behavior. This comparison is especially important because the project was implemented as a pipeline: each later task reused the same tokenization and preprocessing design, but changed the learning objective and generation mechanism.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{2.1cm}p{2.9cm}p{2.8cm}p{2.3cm}p{3.0cm}}
+\toprule
+Model & Training objective & Generation strategy & Main evaluation & Practical observation \\
+\midrule
+LSTM AE & Sequence reconstruction from deterministic latent code & Encode a real window, then decode from its latent vector & Reconstruction loss & Most stable reconstructions, but weakest novelty \\
+VAE & Reconstruction plus KL regularization & Sample latent vector from Gaussian prior and decode & Reconstruction loss + KL loss & More diverse than AE, but some outputs become too short or compressed \\
+Transformer & Autoregressive next-token prediction & Continue a short primer token-by-token & Validation loss and perplexity & Best long-range continuity and strongest overall generation quality \\
+RLHF Transformer & Reward-maximizing policy update with KL penalty to reference model & Sample from fine-tuned Transformer using learned reward guidance & Best reward and qualitative listening comparison & Adds preference alignment, but depends heavily on reward-data quality \\
+\bottomrule
+\end{tabular}
+\caption{High-level comparison across the four project tasks.}
+\label{tab:cross_task_compare}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Property & LSTM AE & VAE & Transformer & RLHF Transformer \\
+\midrule
+Training stability & High & Medium & Medium & Low--Medium \\
+Output diversity & Low--Medium & High & High & High \\
+Long-range coherence & Low--Medium & Medium & High & High \\
+Controllability & Low & Medium & Medium & High \\
+Sampling cost & Low & Low & High & High \\
+Best use in this project & Reconstruction baseline & Latent exploration & Main long-form generator & Preference tuning \\
+\bottomrule
+\end{tabular}
+\caption{Qualitative comparison of model behavior in our implementation.}
+\label{tab:qualitative_compare}
+\end{table}
+
+\paragraph{Task 1 vs. Task 2.}
+The autoencoder and VAE share the same LSTM backbone and token representation, but they behave differently because of the latent-space constraint. The AE learns a deterministic compression of each window and reconstructs it reliably, which is useful as a baseline for symbolic sequence modeling. The VAE instead enforces a smooth latent distribution through the KL term, making random sampling and interpolation possible. In practice, this gave the VAE clearly better diversity, while the AE remained more stable in reconstruction.
+
+\paragraph{Task 2 vs. Task 3.}
+The jump from the VAE to the Transformer was the most important modeling change. The VAE still decodes from a single latent vector, which limits how much local detail can be remembered over long outputs. The Transformer removes this bottleneck by modeling token-by-token continuation directly. This was reflected in the observed results: the Transformer reached validation perplexity 2.54 on the full chunked dataset and produced the most coherent long continuations among the implemented models.
+
+\paragraph{Task 3 vs. Task 4.}
+Task 4 does not replace the Transformer architecture; instead, it changes the optimization target. The pretrained Transformer already generates musically plausible sequences, but RLHF adds an external preference signal. The reward model scores generated sequences based on listener ratings, and the policy is updated to increase this score while staying close to the reference model. This makes Task 4 a preference-alignment layer on top of Task 3 rather than an entirely separate generator.
+
+\paragraph{Overall comparison.}
+Taken together, the four tasks form a coherent progression. Task 1 establishes a reconstruction baseline, Task 2 enables latent sampling and interpolation, Task 3 becomes the strongest generator for long symbolic sequences, and Task 4 introduces human-centered optimization. From an engineering perspective, the comparison also shows that the shared preprocessing design was successful: all four tasks could be trained from the same chunked symbolic dataset with only model-specific training logic changed.
+
 \section{Discussion}
 The progression from AE to VAE to Transformer shows a clear trade-off. The AE is easiest to train and gives stable reconstructions, but it is not ideal for random generation because it lacks a structured prior. The VAE improves diversity by learning a regularized latent space, but its quality depends strongly on the balance between reconstruction and KL regularization. The Transformer is the most suitable model for long sequence generation because it directly learns next-token continuation. Finally, RLHF provides a mechanism to optimize for subjective preference, but its reliability depends on real, sufficiently large human feedback.
 
