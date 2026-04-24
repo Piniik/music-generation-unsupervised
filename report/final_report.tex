@@ -1,0 +1,339 @@
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2026}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\title{Unsupervised Neural Network Models for Large-Scale MIDI Music Generation}
+
+\author{
+  Tahmidul Karim Ronon \\
+  BRAC University \\
+  \texttt{22141022} \\
+  \And
+  Mehedee Hasan Shikhon \\
+  BRAC University \\
+  \texttt{24341268}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project implements and compares four neural approaches for symbolic MIDI music generation: an LSTM autoencoder, a variational autoencoder, a decoder-only Transformer, and a reinforcement learning from human feedback (RLHF) fine-tuning stage. The complete system was built around a reusable MIDI preprocessing pipeline that converts raw MIDI files into token windows, splits data at file level, and supports sharded processing for large-scale training. The full MIDI corpus contained 116,189 discovered MIDI files; to fit ordinary workstation memory and storage limits, preprocessing was performed in file-index shards and then further split into smaller train/validation chunks. The final token vocabulary contained 397 symbols. Across all models, the pipeline used the same symbolic event representation, allowing consistent comparison of reconstruction, diversity, perplexity, and human-preference-based quality. The Transformer achieved the strongest sequence modeling performance in early full-dataset training, reaching validation perplexity 2.54 after the first epoch and 2.55 after the second epoch, while RLHF provided a mechanism for preference-directed refinement using a reward model trained from scored generated samples.
+\end{abstract}
+
+\section{Introduction}
+Music generation is a structured sequence modeling problem. A symbolic music sequence contains pitch, rhythm, note duration, velocity, repetition, and longer-range dependencies between musical phrases. Unlike many supervised tasks, high-quality labeled genre or preference annotations are difficult to obtain at scale, so this project focuses on unsupervised and weakly supervised generative learning from MIDI data.
+
+The goal of the project is to build a complete neural pipeline that learns useful musical representations and generates new MIDI compositions. We implemented the four required stages progressively: first a reconstruction-based LSTM autoencoder, then a VAE for latent sampling, then an autoregressive Transformer for longer sequences, and finally an RLHF stage that fine-tunes the Transformer using a learned reward function. The main contributions of our implementation are:
+
+\begin{itemize}[leftmargin=*]
+    \item a reusable MIDI-to-token preprocessing pipeline;
+    \item deterministic file-level train/validation/test splitting;
+    \item sharded and chunked preprocessing to support over one hundred thousand MIDI files;
+    \item LSTM autoencoder and VAE models using the same token grammar;
+    \item a decoder-only Transformer trained with next-token prediction and evaluated with perplexity;
+    \item an RLHF workflow with survey samples, reward-model training, and policy-gradient fine-tuning.
+\end{itemize}
+
+\section{Dataset and Preprocessing}
+
+\subsection{Dataset}
+The primary dataset was the Lakh MIDI collection. Our file scanner recursively searched the raw MIDI directory for \texttt{.mid} and \texttt{.midi} files and discovered 116,189 files. Because the dataset is large and contains variable-quality MIDI files, the parser skipped unreadable files and discarded files below the configured minimum note threshold. Non-drum note events were extracted and sorted by musical time.
+
+\subsection{Token Representation}
+We used a token-based symbolic representation rather than a piano-roll representation. Each note event was represented using four tokens:
+
+\begin{center}
+\texttt{TIME\_SHIFT} $\rightarrow$ \texttt{NOTE\_ON} $\rightarrow$ \texttt{DURATION} $\rightarrow$ \texttt{VELOCITY}
+\end{center}
+
+This grammar keeps generation simple: every four tokens describe one note-like event. Timing was normalized using beat-based quantization rather than absolute seconds. The configured timing resolution was 16 steps per bar, corresponding to four steps per beat in common 4/4 timing. This choice made the same rhythm more consistent across tempo variations.
+
+The final deterministic vocabulary contained 397 tokens, including special tokens and all allowed timing, pitch, duration, and velocity-bin symbols. Deterministic vocabulary construction was important because earlier vocabulary construction based only on observed tokens could produce different token IDs when trained on different subsets.
+
+\subsection{Windowing and Splitting}
+Token sequences were segmented into fixed-length windows. We used overlapping windows so that long MIDI files contributed multiple training examples while preserving local context. Each encoded record stored the source file path, window index, start-token index, and integer token IDs.
+
+The data split was performed at file level so that windows from the same MIDI file did not appear in multiple splits. Instead of shuffling a monolithic list in memory, the final implementation used deterministic hash-based split assignment. This allowed each shard to be processed independently while still keeping all windows from a file in the same split.
+
+\subsection{Scaling to the Full Dataset}
+A major part of the implementation was engineering the preprocessing pipeline to handle the dataset scale. Initial experiments used small debug and smoke datasets. When scaling up, monolithic JSON files caused memory and disk problems, so the data was processed in 20,000-file shards:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Shard & File index range \\
+\midrule
+1 & 0--19,999 \\
+2 & 20,000--39,999 \\
+3 & 40,000--59,999 \\
+4 & 60,000--79,999 \\
+5 & 80,000--99,999 \\
+6 & 100,000--116,188 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+After preprocessing, large split files were further divided into smaller chunk files. This did not change the total dataset information, but it reduced peak RAM usage because training only needed to load one chunk at a time. Compact JSON output also reduced unnecessary whitespace compared with pretty-printed JSON.
+
+\section{Task 1: LSTM Autoencoder}
+
+\subsection{Objective}
+The first model reconstructs short symbolic music sequences through a learned latent vector. In the final implementation, the autoencoder reuses the tokenized MIDI windows and trains with teacher-forced decoding. For the formal Task 1 setting, this model should be trained on a single-genre subset; for engineering tests, it was also run on larger processed chunks.
+
+\subsection{Model}
+Let a token window be
+\[
+X = \{x_1, x_2, \ldots, x_T\}.
+\]
+The encoder maps the input sequence to a latent representation:
+\[
+z = f_{\phi}(X).
+\]
+The decoder reconstructs the sequence from this latent code:
+\[
+\hat{X} = g_{\theta}(z).
+\]
+
+In our implementation, the encoder is an LSTM over token embeddings. The final hidden state is projected into a latent vector. The decoder is also an LSTM, initialized from the latent vector. To make the decoder depend more strongly on the latent representation, the latent vector is concatenated to the token embedding at every decoder step. The decoder input is shifted using a \texttt{BOS} token:
+\[
+\text{decoder input} = [\texttt{BOS}, x_1, x_2, \ldots, x_{T-1}],
+\]
+while the target remains
+\[
+[x_1, x_2, \ldots, x_T].
+\]
+
+Because the data is token-based, reconstruction was optimized using categorical cross-entropy instead of raw mean squared error:
+\[
+L_{AE} = -\sum_{t=1}^{T} \log p_{\theta}(x_t \mid z, x_{<t}).
+\]
+
+\subsection{Generation}
+Unlike the VAE, the plain autoencoder does not learn an explicit Gaussian prior. Therefore, generation was performed by encoding real training windows and decoding from their latent vectors. This produces reconstructions or variations around real examples rather than completely random samples.
+
+\subsection{Deliverables}
+For Task 1, the deliverables are:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{src/models/autoencoder.py};
+    \item \texttt{src/training/train\_ae.py};
+    \item AE generation/export script;
+    \item reconstruction loss curve from \texttt{ae\_*\_history.json};
+    \item five generated MIDI samples.
+\end{itemize}
+
+\section{Task 2: Variational Autoencoder}
+
+\subsection{Objective}
+The VAE extends the autoencoder by learning a continuous latent distribution that can be sampled to generate more diverse music. Unlike the autoencoder, the VAE is appropriate for random latent sampling because it regularizes the latent space toward a prior distribution.
+
+\subsection{Model}
+The encoder estimates the parameters of a Gaussian latent distribution:
+\[
+q_{\phi}(z \mid X) = \mathcal{N}(\mu(X), \sigma^2(X)).
+\]
+The reparameterization trick samples
+\[
+z = \mu + \sigma \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I).
+\]
+The objective combines reconstruction and KL divergence:
+\[
+L_{VAE} = L_{recon} + \beta D_{KL}(q_{\phi}(z \mid X) \Vert p(z)).
+\]
+
+As with the autoencoder, reconstruction was implemented as token-level cross-entropy. The VAE decoder also receives the latent vector at every time step, and the latent vector initializes both decoder hidden and cell states. A beta-annealing schedule was used so that the model first learned reconstruction before stronger KL regularization was applied.
+
+\subsection{Generation}
+VAE generation samples
+\[
+z \sim \mathcal{N}(0, I)
+\]
+and decodes a constrained event sequence. The generation script restricts the next token type according to the four-token grammar, ensuring syntactically valid groups of \texttt{TIME\_SHIFT}, \texttt{NOTE\_ON}, \texttt{DURATION}, and \texttt{VELOCITY}. Generated tokens are converted back to MIDI using a fixed piano instrument for consistent listening evaluation.
+
+\subsection{Observed Behavior}
+The VAE produced more diverse outputs than the autoencoder, but some generated samples were shorter in wall-clock duration. This happened because MIDI length depends on generated \texttt{TIME\_SHIFT} values, not only on token count. When the VAE sampled many small time shifts, the exported MIDI became compressed in time. This is a representation-level limitation and motivates the Transformer model for longer coherence.
+
+\section{Task 3: Transformer-Based Generator}
+
+\subsection{Objective}
+The Transformer model was designed for long-range autoregressive generation. It predicts the next token conditioned on all previous tokens in a context window:
+\[
+p(X) = \prod_{t=1}^{T} p_{\theta}(x_t \mid x_{<t}).
+\]
+The training loss is
+\[
+L_{TR} = -\sum_{t=1}^{T} \log p_{\theta}(x_t \mid x_{<t}),
+\]
+and perplexity is computed as
+\[
+\mathrm{PPL} = \exp(L_{TR}).
+\]
+
+\subsection{Architecture}
+The implemented model is a decoder-only Transformer built using causal masking. It includes token embeddings, learned positional embeddings, stacked Transformer encoder layers used causally, layer normalization, and a final linear projection to the vocabulary. The model was trained by shifting each window:
+\[
+\text{input} = [x_1, \ldots, x_{T-1}], \quad
+\text{target} = [x_2, \ldots, x_T].
+\]
+
+\subsection{Training Results}
+The full chunked dataset contained 4,621,860 training windows and 575,895 validation windows, with a vocabulary size of 397. Early full-dataset Transformer training produced the following results:
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Epoch & Train Loss & Train PPL & Val Loss & Val PPL \\
+\midrule
+1 & 0.8580 & 2.36 & 0.9326 & 2.54 \\
+2 & 0.7830 & 2.19 & 0.9368 & 2.55 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Although the second epoch improved training loss, validation loss was slightly worse. Therefore, the best checkpoint after these two epochs was the epoch-1 checkpoint. This shows why validation-based checkpointing is necessary: lower training loss alone does not guarantee better generalization.
+
+\subsection{Generation}
+Generation uses a short primer from a real training window, then samples tokens iteratively with grammar-aware constraints. The generated token sequence is converted to MIDI using the same parser as the AE and VAE outputs. Task 3 outputs are expected to be longer and more coherent than AE/VAE outputs because the Transformer explicitly models autoregressive continuation rather than reconstructing a fixed latent window.
+
+\section{Task 4: RLHF Preference Tuning}
+
+\subsection{Objective}
+The RLHF stage fine-tunes the trained Transformer using a reward signal derived from listener scores. The base Transformer acts as the policy \(p_{\theta}(X)\). Generated samples are scored, a reward model is trained, and then the policy is updated using a policy-gradient objective:
+\[
+J(\theta) = \mathbb{E}[r(X_{gen})],
+\]
+\[
+\nabla_{\theta} J(\theta) = \mathbb{E}[r \nabla_{\theta} \log p_{\theta}(X)].
+\]
+
+\subsection{Reward Model}
+The reward model is a bidirectional LSTM regressor. It maps generated token sequences to a normalized score in \([0,1]\). Human scores on the original 1--5 scale are normalized as
+\[
+1 \mapsto 0.00, \quad 2 \mapsto 0.25, \quad 3 \mapsto 0.50, \quad 4 \mapsto 0.75, \quad 5 \mapsto 1.00.
+\]
+
+For testing the pipeline, a 20-sample score table was used to train the reward model. If this table is replaced by real listeners, the final report should state the number of participants and the average score per sample. If mock or synthetic ratings are used, they should be clearly described as pilot/synthetic data rather than real human evaluation.
+
+\subsection{Policy Fine-Tuning}
+During RLHF, the policy generates sequences from primer tokens. The reward model scores the completed sequence. We also keep a frozen reference Transformer and add a KL-style penalty to reduce drift from the original model. The optimized loss is approximately
+\[
+L_{RLHF} = -A(X) \log p_{\theta}(X) + \lambda_{KL}\left(\log p_{\theta}(X)-\log p_{ref}(X)\right),
+\]
+where \(A(X)\) is the reward advantage relative to a moving baseline.
+
+In early RLHF testing, the best reward observed in the printed training log was 0.5936 at step 3. Later steps fluctuated below this value, so the best checkpoint remained the step-3 checkpoint. This behavior is expected because policy-gradient training is stochastic and the checkpoint is saved only when the observed reward improves.
+
+\section{Implementation Details}
+
+\subsection{Software and Hardware}
+The project was implemented in Python using PyTorch. MIDI processing used \texttt{pretty\_midi} and related MIDI utilities. Training was tested across CUDA, CPU, and Apple MPS environments. On newer NVIDIA GPUs, the PyTorch CUDA wheel version must match the GPU architecture; for example, RTX 50-series cards may require a newer CUDA-enabled PyTorch build.
+
+\subsection{Memory-Efficient Training}
+The original training code loaded all JSON data into memory at once. This caused memory errors on the full dataset. The final training loaders were changed to use \texttt{IterableDataset}, loading one JSON chunk at a time. This reduced peak RAM usage and enabled training across millions of token windows.
+
+\subsection{Checkpointing}
+Each model saves the best checkpoint based on validation loss or reward:
+\begin{itemize}[leftmargin=*]
+    \item AE: best validation reconstruction loss;
+    \item VAE: best validation VAE loss;
+    \item Transformer: best validation cross-entropy/perplexity;
+    \item RLHF: best observed reward-model score.
+\end{itemize}
+This was essential because power outages and long training times made uninterrupted training difficult.
+
+\section{Experimental Challenges and Solutions}
+
+\subsection{Large JSON Files}
+Preprocessing initially produced very large JSON files. Pretty-printed JSON also wasted disk space through whitespace. The final solution used compact JSON chunks and smaller train/validation files.
+
+\subsection{Disk Space and Corruption}
+During preprocessing, a disk-full error corrupted an intermediate windowed JSON file. The solution was to identify the broken shard, delete the incomplete window file, rerun the windowing and encoding stages, and avoid relying on partially written JSON output.
+
+\subsection{Power Outages}
+Power outages interrupted preprocessing and training. We addressed this through sharded preprocessing, separate train/validation chunks, and checkpoint saving after successful stages. A progress file can also be used for future preprocessing runs so that completed shards are skipped automatically.
+
+\subsection{Model-Specific Issues}
+The AE produced stable reconstructions but limited novelty. The VAE generated more diverse samples, but some outputs were temporally compressed due to small sampled \texttt{TIME\_SHIFT} tokens. The Transformer required more compute but provided the best framework for longer continuation. RLHF was sensitive to the quality and size of the reward dataset.
+
+\section{Results}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Model & Main Metric & Strength & Limitation & Required Output \\
+\midrule
+Random baseline & -- & Simple comparison & No structure & MIDI samples \\
+Markov baseline & -- & Local transitions & Weak long-term form & MIDI samples \\
+LSTM AE & Recon. loss & Stable reconstruction & Low diversity & 5 MIDI files \\
+VAE & Recon. + KL & Diverse latent sampling & Occasional short outputs & 8 MIDI files \\
+Transformer & Perplexity & Best long context & High compute cost & 10 MIDI files \\
+RLHF Transformer & Reward score & Preference tuning & Depends on score quality & 10 MIDI files \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Model & Loss / Reward & Perplexity & Diversity & Notes \\
+\midrule
+Autoencoder & Fill from \texttt{ae\_*\_history.json} & -- & Medium & Single-genre deliverable \\
+VAE & Fill from \texttt{vae\_*\_history.json} & -- & High & Multi-genre latent sampling \\
+Transformer & 0.9326 val loss & 2.54 & High & Best checkpoint after epoch 1 \\
+RLHF & 0.5936 best reward & -- & High & Reward-model-guided tuning \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The numerical AE and VAE losses should be filled from the final saved history files after the last runs complete. The Transformer table already includes the observed full-dataset training log values from the current implementation.
+
+\section{Discussion}
+The progression from AE to VAE to Transformer shows a clear trade-off. The AE is easiest to train and gives stable reconstructions, but it is not ideal for random generation because it lacks a structured prior. The VAE improves diversity by learning a regularized latent space, but its quality depends strongly on the balance between reconstruction and KL regularization. The Transformer is the most suitable model for long sequence generation because it directly learns next-token continuation. Finally, RLHF provides a mechanism to optimize for subjective preference, but its reliability depends on real, sufficiently large human feedback.
+
+The engineering work was as important as the model definitions. Without sharding, chunking, compact JSON, and streaming loaders, the full MIDI dataset could not be used on ordinary machines. These implementation decisions made the project scalable enough to train on millions of token windows.
+
+\section{Conclusion}
+We implemented a complete symbolic MIDI generation system using four progressively stronger neural methods. The preprocessing pipeline converts MIDI into beat-normalized symbolic tokens, builds fixed-length windows, and supports file-level train/validation/test splitting. The AE and VAE learn latent representations, the Transformer models long-range autoregressive continuation, and the RLHF stage demonstrates preference-guided fine-tuning. The best early Transformer result achieved validation perplexity 2.54 on the large chunked dataset. The final system produces MIDI outputs for all four tasks and includes the required training histories, checkpoints, and generation scripts.
+
+\section{Future Work}
+Future improvements include replacing JSON with a binary dataset format, adding explicit genre conditioning, increasing the size and reliability of the human feedback dataset, improving reward modeling, and exploring more advanced architectures such as Music Transformer variants or diffusion-based symbolic music models. Real listening tests with at least 10 participants should be used for the final RLHF evaluation if the project is submitted as a human-preference study.
+
+\begin{thebibliography}{9}
+\bibitem{kingma2013vae}
+D. P. Kingma and M. Welling. Auto-Encoding Variational Bayes. 2013.
+
+\bibitem{vaswani2017attention}
+A. Vaswani et al. Attention Is All You Need. 2017.
+
+\bibitem{raffel2016lakh}
+C. Raffel. Learning-Based Methods for Comparing Sequences, with Applications to Audio-to-MIDI Alignment and Matching. PhD thesis, Columbia University, 2016.
+
+\bibitem{christiano2017deep}
+P. Christiano et al. Deep Reinforcement Learning from Human Preferences. 2017.
+\end{thebibliography}
+
+\appendix
+\section{Generated Artifacts Checklist}
+The final project folder should include:
+\begin{itemize}[leftmargin=*]
+    \item AE checkpoint and reconstruction-loss plot;
+    \item VAE checkpoint and KL/reconstruction-loss plot;
+    \item Transformer checkpoint and perplexity plot;
+    \item RLHF reward model and tuned Transformer checkpoint;
+    \item generated MIDI files for all required tasks;
+    \item human or pilot survey CSV for Task 4;
+    \item source code and requirements file.
+\end{itemize}
+
+\end{document}
